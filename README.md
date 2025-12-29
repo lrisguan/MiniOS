@@ -1,5 +1,9 @@
 # Lrix
 
+<p align="center">
+<a ><b>English</b></a> | <a href="README.zh-CN.md"><b>中文</b></a>
+</p>
+
 ## 📌 Introduction
 This is a scratch implemention of a Operating System based on [RISC-V](https://riscv.org).
 
