@@ -1,10 +1,10 @@
 /*
  * Lrix
  * Copyright (C) 2025 lrisguan <lrisguan@outlook.com>
- * 
+ *
  * This program is released under the terms of the GNU General Public License version 2(GPLv2).
  * See https://opensource.org/licenses/GPL-2.0 for more information.
- * 
+ *
  * Project homepage: https://github.com/lrisguan/Lrix
  * Description: A scratch implemention of OS based on RISC-V
  */
@@ -34,6 +34,7 @@ int kmain() {
   INFO("Initializing kernel...");
   kinit(_heap_start, _heap_end); // initialize kernel memory manager
   vmm_init();                    // initialize virtual memory
+  vmm_activate();                // set satp to Sv39 root page table
   scheduler_init();              // initialize process scheduler
   blk_init();                    // initialize block device (virtio-blk)
   fs_init();                     // initialize simple in-memory filesystem (later on-disk)

@@ -155,7 +155,7 @@ PCB *proc_create(const char *name, uint64_t entrypoint, int prior) {
   pcb->regstat.sp = pcb->stacktop;
 
   uint64_t mstatus_val = 0;
-  mstatus_val |= (3ULL << 11); // Set MPP to Machine Mode
+  mstatus_val |= (3ULL << 11); // MPP = Machine mode
   mstatus_val |= (1ULL << 7);  // Set MPIE to 1
   pcb->regstat.mstatus = mstatus_val;
 
