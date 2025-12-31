@@ -1,0 +1,699 @@
+\documentclass[12pt]{ctexart}
+\usepackage[margin=1.9cm]{geometry}
+\usepackage[UTF8]{ctex}
+\usepackage{times}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{fontspec}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage[backend=biber,style=numeric,doi=false,isbn=false,url=true]{biblatex}
+\renewcommand{\UrlFont}{\rmfamily}
+
+\addbibresource{./lrixref.bib}
+
+\setmainfont{TeX Gyre Termes}
+\setmonofont{DejaVu Sans Mono}
+\makeatletter
+\newcommand\dlmu[2][4cm]{\hskip1pt\underline{\hb@xt@ #1{\hss#2\hss}}\hskip3pt}
+\makeatother
+
+\title{\textbf{Lrix: 一个草稿(scratch) RISC-V 操作系统}}
+
+\author{
+  \kaishu \Large 项目: Lrix\\
+  \Large GitHub: \url{https://github.com/lrisguan/Lrix} \\
+  }
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+
+\begin{abstract}
+Lrix 是一个针对 RISC-V 架构和 QEMU \texttt{virt} 机器平台，从零开始编写的运行在机器模式
+下的教学操作系统。这也是我为什么称它为 scratch的原因（也许在将来我会解决这个问题）。
+本报告对内核与用户空间的设计进行了简要的技术概览，重点介绍了内存管理、进程管理、
+文件系统、Trap 与中断处理、系统调用接口以及内置 Shell。
+\end{abstract}
+
+\section{引言}
+Lrix 是一个使用 C 语言和 RISC-V 汇编实现的小型教学导向操作系统。它在 QEMU \texttt{riscv64 virt} 
+平台上启动，使用简单的 UART 驱动进行控制台 I/O，并提供了极简的类 UNIX 进程与文件抽象。
+顶层的 \texttt{Makefile} 构建内核镜像和用户程序，并使用 VirtIO 块设备作为后端存储在 QEMU 中运行。
+注：在开发 Lrix 时，我参考了 \cite{riscv}, \cite{riscv:priv}, \cite{riscv:user}, 
+\cite{xv6-riscv}, \cite{xv6-riscv}, \cite{virtio}, \cite{virtio-1.1}。
+
+内核入口点 \texttt{kmain} 执行以下高层级步骤：
+\begin{enumerate}
+  \item 初始化 UART 以进行串行输出。
+  \item 初始化 Trap/中断子系统和 PLIC。
+  \item 初始化物理页分配器和虚拟内存管理器。
+  \item 初始化调度器并创建 Idle 进程。
+  \item 初始化 VirtIO 块设备驱动和基于 inode 的简单文件系统。
+  \item 创建运行 Shell 的初始用户进程，然后开启中断，并通过 \texttt{wfi} 进入空闲状态，
+        由定时器中断驱动调度。
+\end{enumerate}
+
+\section{内核子系统}
+本节总结了 \texttt{kernel/} 下的主要内核模块，重点介绍内存管理、进程管理、文件系统和 Trap 处理。
+
+\subsection{引导与入口 (boot/)}
+
+\texttt{boot/start.S} 中的引导代码负责底层的 CPU 初始化：
+\begin{itemize}
+  \item 将初始栈指针设置为链接器提供的 \texttt{\_stack\_top}。
+  \item 通过从 \texttt{\_bss\_start} 迭代到 \texttt{\_bss\_end} 来清零 BSS 段。
+  \item 调用 C 入口点 \texttt{kmain}，如果该函数返回，则进入死循环。
+\end{itemize}
+这段代码在 Machine 模式下运行，为内核准备一个干净的 C 环境。
+
+\subsection{UART 与日志 (uart/, include/log.h)}
+
+\texttt{uart/uart.c} 中的 UART 驱动实现了针对 QEMU \texttt{virt} 机器上映射在 
+\texttt{0x10000000} 的兼容 NS16550 的 UART 的中断 I/O。（对于中断I/O，你可以开启
+编译选项 \textbf{TRAP\_DEBUG} 来查看）。
+它提供：
+\begin{itemize}
+  \item \texttt{uart\_init}: 将 UART 配置为 8N1 模式。
+  \item \texttt{uart\_putc}, \texttt{uart\_getc}, 和 \texttt{uart\_getc\_blocking}: 
+        用于基本的字符 I/O。
+  \item \texttt{uart\_getline} 和一个小型的类似 scanf 的 \texttt{scank}: 用于解析用户输入。
+  \item \texttt{printk}: 一个极简的格式化打印例程，支持标准的整数、字符串和指针格式。
+\end{itemize}
+头文件 \texttt{include/log.h} 在 \texttt{printk} 和 ANSI 转义码的基础上构建，提供了
+诸如 \texttt{INFO}, \texttt{WARNING}, 和 \texttt{ERROR} 等内核通用的彩色日志宏。
+
+\subsection{字符串库 (string/)}
+
+\texttt{string/string.c} 文件实现了内核和用户空间使用的一小部分 libc 字符串和内存函数，
+包括 \texttt{memset}, \texttt{memcpy}, \texttt{memmove}, \texttt{memcmp}, 
+\texttt{strlen}, \texttt{strcmp}, 和 \texttt{strncmp}。这避免了对外部 C 库的依赖。
+
+\subsection{底层 RISC-V 辅助函数 (include/riscv.h, include/types.h)}
+
+头文件 \texttt{include/riscv.h} 包含常用 RISC-V CSR 的内联汇编辅助函数，特别是 
+\texttt{intr\_on} 和 \texttt{intr\_off}，它们用于设置或清除 \texttt{mstatus} 
+中的机器中断使能 (MIE) 位。这在调度器和 Trap 代码中被广泛用于划定临界区。
+
+头文件 \texttt{include/types.h} 定义了基本类型和 \texttt{RegState} 结构体，
+该结构体保存调度器和上下文切换机制使用的 RISC-V 寄存器上下文（通用寄存器、
+\texttt{sepc}、\texttt{sp} 和 \texttt{mstatus}）。
+
+\newpage
+\begin{longtable}{|c|l|l|p{0.55\linewidth}|}
+\caption{寄存器状态结构体字段描述}
+\label{tab:registerstate_en}                                   \\ 
+\hline
+Field Name & Register Alias & Field Type & Description         \\
+\hline
+\endfirsthead 
+\caption[]{寄存器状态结构体字段描述（续表）}                      \\
+\hline
+成员名 & 寄存器别名 & 字段类型 & 描述                             \\
+\hline
+\endhead
+\hline
+\endfoot
+\hline
+\endlastfoot
+x1         & ra         & uint64\_t  & 返回地址（Return Address）\\
+\hline
+x5         & t0         & uint64\_t  & 临时寄存器0              \\
+\hline
+x6         & t1         & uint64\_t  & 临时寄存器1              \\
+\hline
+x7         & t2         & uint64\_t  & 临时寄存器2              \\
+\hline
+x8         & s0/fp      & uint64\_t  & 保存寄存器0/帧指针       \\
+\hline
+x9         & s1         & uint64\_t  & 保存寄存器1              \\
+\hline
+x10        & a0         & uint64\_t  & 参数/返回值寄存器0       \\
+\hline
+x11        & a1         & uint64\_t  & 参数/返回值寄存器1       \\
+\hline
+x12        & a2         & uint64\_t  & 参数寄存器2              \\
+\hline
+x13        & a3         & uint64\_t  & 参数寄存器3              \\
+\hline
+x14        & a4         & uint64\_t  & 参数寄存器4              \\
+\hline
+x15        & a5         & uint64\_t  & 参数寄存器5              \\
+\hline
+x16        & a6         & uint64\_t  & 参数寄存器6              \\
+\hline
+x17        & a7         & uint64\_t  & 参数寄存器7              \\
+\hline
+x18        & s2         & uint64\_t  & 保存寄存器2              \\
+\hline
+x19        & s3         & uint64\_t  & 保存寄存器3              \\
+\hline
+x20        & s4         & uint64\_t  & 保存寄存器4              \\
+\hline
+x21        & s5         & uint64\_t  & 保存寄存器5              \\
+\hline
+x22        & s6         & uint64\_t  & 保存寄存器6              \\
+\hline
+x23        & s7         & uint64\_t  & 保存寄存器7              \\
+\hline
+x24        & s8         & uint64\_t  & 保存寄存器8              \\
+\hline
+x25        & s9         & uint64\_t  & 保存寄存器9              \\
+\hline
+x26        & s10        & uint64\_t  & 保存寄存器10             \\
+\hline
+x27        & s11        & uint64\_t  & 保存寄存器11             \\
+\hline
+x28        & t3         & uint64\_t  & 临时寄存器3              \\
+\hline
+x29        & t4         & uint64\_t  & 临时寄存器4              \\
+\hline
+x30        & t5         & uint64\_t  & 临时寄存器5              \\
+\hline
+x31        & t6         & uint64\_t  & 临时寄存器6              \\
+\hline
+sepc       & -          & uint64\_t  & 异常返回地址             \\
+\hline
+sp         & -          & uint64\_t  & 栈指针（Stack Pointer）  \\
+\hline
+mstatus    & -          & uint64\_t  & 机器态状态寄存器         \\
+\hline
+\end{longtable}
+
+\subsection{物理内存管理 (mem/kmem.c)}
+
+物理内存分配由 \texttt{mem/kmem.c} 中的简单页式分配器执行。分配器由 \texttt{kinit} 
+初始化，后者接收链接描述文件中定义的堆范围。
+
+该实现维护：
+\begin{itemize}
+  \item 一个位于堆起始位置的 \texttt{Page} 描述符数组。
+  \item 一个 \texttt{Page} 对象的单向空闲链表。
+  \item 总页数、空闲页数和已用页数的计数器。
+\end{itemize}
+关键操作包括：
+\begin{itemize}
+  \item \textbf{初始化}: \texttt{Page} 描述符数组占用堆起始处的整数个页面；
+                        这些页面被标记为已用，其余页面插入空闲链表。
+  \item \textbf{分配 (kalloc)}: 从空闲链表中弹出一个 \texttt{Page}，将其标记为已用，
+                            根据其索引计算物理地址，并在返回给调用者之前将该页面清零。
+  \item \textbf{释放 (kfree)}: 验证地址和对齐方式，将其映射回 \texttt{Page} 描述符，
+                              防止双重释放，并将其推回空闲链表。
+\end{itemize}
+诊断辅助函数暴露统计信息（总/空闲/已用页数）并可打印分配器状态摘要。
+
+\subsection{虚拟内存管理实现（mem/vmm.c）}
+虚拟内存管理器（Virtual Memory Manager, VMM）实现了标准的RISC-V Sv39页表层级结构，
+负责内核基础映射（内存RAM和内存映射I/O（MMIO））以及用户堆页面的按需分配。
+
+\paragraph{Sv39页表布局}
+Lrix采用标准的三级Sv39页表方案：
+\begin{itemize}
+  \item 虚拟地址分为VPN2（38-30位）、VPN1（29-21位）、
+        VPN0（20-12位）和4KB页偏移量（11-0位）。
+  \item 每个页表页大小为4KB，包含512个64位页表项（PTE）。
+  \item 叶子页表项（Leaf PTE）编码物理页号（PPN）以及Sv39标志位（V/R/W/X/U/A/D）。
+  \item 非叶子页表项（中间层级）标记为有效（V=1），但清除所有R/W/X/A/D位，
+        这符合Sv39规范要求。
+\end{itemize}
+内核维护一个单独的二级根页表（level-2），名为\texttt{kernel\_pd}，
+其物理地址存储在\texttt{kernel\_pd\_phys}中。
+所有页表内存均通过物理内存分配器（\texttt{kalloc}）分配，
+并在使用前显式初始化为零。
+
+\paragraph{初始化与恒等映射}
+入口函数\texttt{vmm\_init}执行以下步骤：
+\begin{itemize}
+  \item 分配并清零二级根页表，将其虚拟地址和物理地址分别存储到
+        \texttt{kernel\_pd}和\texttt{kernel\_pd\_phys}。
+  \item 执行最小化自测试（\texttt{vmm\_self\_test}）：将测试虚拟地址映射到
+        新分配的物理页，通过\texttt{vmm\_translate}验证地址转换正确性，
+        然后解除映射并确认转换失效。
+  \item 为\texttt{virt}虚拟机的关键内存区域建立恒等映射（虚拟地址=物理地址）：
+        \begin{itemize}
+          \item 主内存（Main RAM）：\texttt{0x80000000}--\texttt{0x80000000 + 128MB}，
+                映射为可读可写且用户可访问（\texttt{VMM\_P\_RW | VMM\_P\_USER}），
+                确保启用分页后内核和用户的代码/数据/栈仍能正常工作。
+          \item UART MMIO（地址\texttt{0x10000000}）和VirtIO MMIO窗口
+                \texttt{[VIRTIO\_MMIO\_START, VIRTIO\_MMIO\_END)}，
+                映射为内核独占的可读可写区域。
+          \item CLINT定时器（\texttt{0x02000000}--\texttt{0x02010000}），
+                映射为内核可读可写。
+          \item PLIC MMIO区域（起始地址\texttt{PLIC\_BASE}），
+                为中断控制器寄存器分配小型恒等映射窗口。
+        \end{itemize}
+\end{itemize}
+这些恒等映射确保启用Sv39地址转换后，内核仍可使用相同的虚拟地址访问代码、数据、
+堆和设备寄存器。
+
+\paragraph{启用Sv39分页机制}
+初始化完成后，\texttt{kmain}调用\texttt{vmm\_activate}启用硬件分页：
+\begin{itemize}
+  \item 计算页表物理页号（PPN）：\texttt{kernel\_pd\_phys >> 12}。
+  \item 构造Sv39格式的\texttt{satp}寄存器值：MODE=8（表示Sv39模式）、ASID=0，
+        低34位存储页表PPN。
+  \item 将该值写入\texttt{satp}控制状态寄存器（CSR），并执行
+        \texttt{sfence.vma}指令刷新过时的TLB条目。
+\end{itemize}
+为保证可移植性，保留了两个占位钩子函数\texttt{arch\_set\_cr3}和
+\texttt{arch\_enable\_paging}，但在RISC-V架构上不执行任何操作；
+所有实际的分页启用逻辑均通过\texttt{satp}寄存器实现。
+
+\paragraph{映射、解除映射与地址转换}
+核心操作基于一个遍历三级页表的辅助函数实现：
+\begin{itemize}
+  \item \textbf{\texttt{get\_next\_level}}：接收页表指针、索引和分配标志（\texttt{alloc}）。
+        若对应页表项无效且分配标志已启用，则分配新的页表页，
+        安装非叶子页表项（有效但无R/W/X/A/D位），并返回下一级页表指针。
+        若页表项已有效，则将其物理页号（PPN）转换为（恒等映射的）虚拟地址，
+        作为下一级页表指针返回。
+  \item \textbf{\texttt{vmm\_map}}（建立映射）：
+        \begin{itemize}
+          \item 要求虚拟地址和物理地址均按页对齐。
+          \item 遍历L2$\rightarrow$L1$\rightarrow$L0页表，按需分配中间层级页表。
+          \item 将抽象的VMM标志位（\texttt{VMM\_P\_*}）转换为Sv39页表项标志位（V/R/W/X/U/A/D）。
+                目前\texttt{VMM\_P\_RW}隐含R/W/X权限（以便代码页和数据页无需单独设置执行权限），
+                且主动设置A/D位（访问位和脏位）。
+          \item 在L0层级安装叶子页表项，包含目标物理地址和权限标志。
+        \end{itemize}
+  \item \textbf{\texttt{vmm\_map\_page}}（映射新物理页）：
+        \begin{itemize}
+          \item 通过\texttt{kalloc}分配新的物理页并清零，
+                调用\texttt{vmm\_map}将其映射到指定虚拟地址。
+        \end{itemize}
+  \item \textbf{\texttt{vmm\_unmap}}（解除映射）：
+        \begin{itemize}
+          \item 遍历页表（不分配中间层级）。
+          \item 若找到有效叶子页表项，则清除该页表项；
+                当\texttt{free\_phys}为非零时，将底层物理页归还给分配器。
+          \item 目前不回收已空的中间页表（以简化实现，代价是少量内存开销）。
+        \end{itemize}
+  \item \textbf{\texttt{vmm\_translate}}（地址转换）：
+        \begin{itemize}
+          \item 对指定虚拟地址执行软件页表遍历，
+                若找到有效页表项，则返回对应的物理地址指针
+                （物理页号PPN与原页偏移量组合）。
+          \item 主要用于调试和内置自测试。
+        \end{itemize}
+\end{itemize}
+额外辅助函数\texttt{vmm\_get\_page\_directory}、
+\texttt{vmm\_set\_page\_directory}和\texttt{vmm\_get\_pd\_phys}
+用于暴露当前内核根页表，为未来的进程独立地址空间奠定基础
+（当前系统仍使用单一全局Sv39页表）。
+
+\paragraph{Sv39架构下的用户堆分配}
+用户堆基于Sv39映射机制实现，布局设计简洁：
+\begin{itemize}
+  \item 每个进程分配独立的堆区域，起始地址为
+        \(\text{HEAP\_USER\_BASE} + \text{pid} \times \text{PER\_PROC\_HEAP}\)，
+        其中\texttt{HEAP\_USER\_BASE}为\texttt{0x80400000}，
+        \texttt{PER\_PROC\_HEAP}为8KB（每个进程堆大小）。
+  \item \texttt{syscall.c}中的系统调用实现\texttt{SYS\_SBRK}（\texttt{sys\_sbrk}）
+        通过调用\texttt{vmm\_map\_page}为每个新增4KB页扩展堆区域，
+        始终使用\texttt{VMM\_P\_RW | VMM\_P\_USER}标志，
+        确保用户代码可读写新映射的内存。
+  \item 全局Sv39页表与进程独立堆窗口的组合，
+        实现了进程级连续虚拟堆空间，同时保持整体设计简洁
+        （暂未支持进程专属\texttt{satp}寄存器切换）。
+\end{itemize}
+
+\subsection{进程管理与调度 (proc/)}
+
+进程管理在 \texttt{proc/proc.c} 中实现。核心数据结构是进程控制块 (PCB)，包含：
+\begin{itemize}
+  \item 进程标识符 (PID) 和父进程 PID (PPID)。
+  \item 调度状态 (READY, RUNNING, BLOCKED, TERMINATED) 和优先级。
+  \item 内核栈顶地址和保存的寄存器上下文 (\texttt{RegState})。
+  \item 每进程堆基址 \texttt{brk\_base} 和大小 \texttt{brk\_size}。
+  \item 用于调试和 Shell 输出的进程名称。
+\end{itemize}
+
+\begin{longtable}{|l|l|p{9cm}|}
+  \caption{进程控制块（ProcessControlBlock, PCB）结构体定义}
+  \label{tab:pcb_cn} \\
+  \hline
+  \textbf{成员名} & \textbf{数据类型} & \textbf{说明} \\
+  \hline
+  \endfirsthead  % 第一页表头结束
+
+  \caption[]{进程控制块（ProcessControlBlock, PCB）结构体定义（续表）} \\
+  \hline
+  \textbf{成员名} & \textbf{数据类型} & \textbf{说明} \\
+  \hline
+  \endhead  % 后续页面表头
+
+  \hline
+  \multicolumn{3}{r}{下一页续表} \\
+  \endfoot  % 每页表尾（非最后一页）
+
+  \hline
+  \endlastfoot  % 最后一页表尾
+
+  pid            & int         & 进程唯一标识符 \\
+  \hline
+  pstat          & ProcState   & 进程运行状态（如就绪、运行、阻塞等） \\
+  \hline
+  name[20]       & char        & 进程名称（最大支持20个字符） \\
+  \hline
+  prior          & int         & 进程优先级（值越小，优先级越高） \\
+  \hline
+  entrypoint     & uint64\_t    & 进程入口点（起始指令地址） \\
+  \hline
+  stacktop       & uint64\_t    & 进程栈顶的虚拟地址 \\
+  \hline
+  ppid           & int         & 父进程ID（内核/初始化进程的父进程ID为0） \\
+  \hline
+  brk\_base      & void *      & 程序中断点基地址（堆起始地址） \\
+  \hline
+  brk\_size      & uint64\_t    & 已分配堆空间大小（单位：字节） \\
+  \hline
+  cpu\_time      & uint64\_t    & 进程消耗的总CPU时间 \\
+  \hline
+  remain\_time   & uint64\_t    & 进程调度剩余时间片 \\
+  \hline
+  arriv\_time    & uint64\_t    & 进程进入系统的到达时间 \\
+  \hline
+  regstat        & RegState    & 用于上下文切换的保存寄存器状态 \\
+  \hline
+  next           & PCB *       & 用于进程队列管理的链表指针 \\
+  \hline
+\end{longtable}
+
+全局变量跟踪当前进程、Idle 进程、就绪队列以及阻塞和僵尸进程的链表。
+
+\paragraph{Idle 进程与调度器初始化}
+\texttt{scheduler\_init} 初始化就绪队列并创建一个 PID 为 0 的 \emph{idle} 进程，
+拥有自己的内核栈和入口函数 \texttt{idle\_entry}。Idle 进程只是简单地开启中断并在循环中执行 
+\texttt{wfi}，出让 CPU 直到定时器中断到达。
+
+\paragraph{进程创建}
+存在两条创建路径：
+\begin{itemize}
+  \item \textbf{\texttt{proc\_create}} 由内核用于创建初始 Shell 进程。
+  它分配一个 PCB 和内核栈，初始化寄存器状态，以便从第一次上下文切换返回时跳转到给定的入口点，
+  并将进程加入就绪队列。
+  \item \textbf{\texttt{proc\_fork}} 实现 \texttt{fork} 系统调用。它克隆父进程的
+   PCB 和内核栈，调整子进程的栈指针以镜像父进程的栈帧布局，将子进程的 \texttt{a0} 
+   寄存器设为 0（使子进程看到 \texttt{fork()} 返回 0），并使用 \
+   texttt{vmm\_map\_page} 和 \texttt{memcpy} 深度复制用户堆。
+   随后子进程被作为 READY 加入队列。
+\end{itemize}
+
+\paragraph{退出、等待与僵尸进程}
+当进程调用 \texttt{exit} 时，\texttt{proc\_exit} 将其标记为 TERMINATED，
+链接到 \texttt{zombie\_list}，如果父进程阻塞在 \texttt{wait} 中，则唤醒父进程。
+\texttt{proc\_wait\_and\_reap} 在 \texttt{zombie\_list} 中搜索调用进程的子进程，
+释放其内核栈，通过 \texttt{vmm\_unmap} 取消映射其堆页面，释放 PCB，并返回子进程的 PID。 
+\texttt{ppid == 0} 的孤儿僵尸进程最终会被 \texttt{zombies\_free} 回收，该函数由调度器择机调用。
+
+\paragraph{调度算法}
+\texttt{schedule} 函数提供了一个简单的轮转 (Round-robin) 风格调度器：
+\begin{itemize}
+  \item 它从 \texttt{ready\_queue} 中取出下一个 READY 进程。如果没有可用的进程，
+  且当前进程仍为 RUNNING 且非 Idle 进程，则当前进程继续运行。否则，调度器选择 Idle 进程。
+  \item 正在运行的进程（如果有）被降级为 READY 并重新入队（Idle 进程除外）。
+  TERMINATED 进程保留在僵尸链表中。
+  \item 通过汇编例程 \texttt{switch\_context} 执行上下文切换，
+  保存旧的 \texttt{RegState} 并恢复新的。
+  \item 从上下文切换返回后，调度器调用 \texttt{zombies\_free} 清理任何孤儿僵尸进程。
+\end{itemize}
+调度器由周期性的机器定时器中断驱动，中断处理程序会重新编程 CLINT 定时器并从 Trap 
+处理程序调用 \texttt{schedule}。
+
+\paragraph{其他进程操作}
+进程子系统还提供：
+\begin{itemize}
+  \item \texttt{proc\_dump}: 打印所有进程的快照（由 \texttt{ps} 系统调用使用）。
+  \item \texttt{proc\_suspend\_current}: 将当前进程移入阻塞链表并 \texttt{schedule} 
+  另一个进程；由 Shell 的 \texttt{bg} 命令使用。
+  \item \texttt{proc\_kill}: 按 PID 杀死进程，搜索就绪、阻塞和僵尸链表，立即释放资源。
+  \item \texttt{proc\_shutdown\_all}: 用于系统关机期间，释放就绪、阻塞和僵尸链表中的所有非 Idle 进程。
+\end{itemize}
+
+\subsection{文件系统与块设备 (fs/, fs/blk.c)}
+
+文件系统支持构建在 VirtIO 块驱动程序和极简的基于 inode 的文件系统之上。
+
+\paragraph{VirtIO 块驱动}
+\texttt{fs/blk.c} 中的驱动程序探测 MMIO 范围内的 VirtIO 设备，寻找 \texttt{DEVICE\_ID == 2}
+（块设备）的设备。它通过配置适当的队列寄存器支持 VirtIO MMIO版本 1 和版本 2。
+
+每个 I/O 请求使用一个包含三个描述符的小型 virtqueue：
+\begin{enumerate}
+  \item 读写操作和目标扇区的请求头。
+  \item 一个 512 字节扇区的数据缓冲区。
+  \item 由设备写入的状态字节。
+\end{enumerate}
+通过更新可用环并通过 MMIO \texttt{QUEUE\_NOTIFY} 寄存器通知设备来提交请求。
+完成检测通过轮询已用环索引实现；设备中断由 \texttt{blk\_intr} 通过 Trap 和 PLIC 代码处理。
+
+公共接口导出 \texttt{blk\_read\_sector} 和 \texttt{blk\_write\_sector}，
+专供文件系统层使用。
+
+\paragraph{磁盘布局与 Inode}
+\texttt{fs/fs.c} 和 \texttt{fs/fs.h} 中的文件系统在 64 KB 磁盘镜像上使用非常小的固定大小布局：
+\begin{itemize}
+  \item 块 0: 超级块 (\texttt{struct superblock})。
+  \item 块 1--4: Inode 表 (\texttt{struct dinode})。
+  \item 块 5: 空闲块位图。
+  \item 块 6--127: 数据块。
+\end{itemize}
+每个 Inode (\texttt{struct dinode}) 包含类型（空闲、普通文件、目录）、链接计数、文件大小、
+一个包含 10 个直接块地址的数组和一个间接块指针。间接块保存一个数据块地址数组，
+因此每个文件的最大块数为 \(\text{MAXFILE} = \text{NDIRECT} + \text{NINDIRECT}\)。
+
+\paragraph{块与 Inode 管理}
+内部辅助函数包括：
+\begin{itemize}
+  \item \texttt{b\_read} / \texttt{b\_write}: 针对 512 字节扇区的 VirtIO 驱动包装器。
+  \item \texttt{balloc} / \texttt{b\_free}: 通过操作位图块中的位图来分配和释放数据块。
+  \item \texttt{read\_dinode} / \texttt{write\_dinode}: 根据 Inode 编号加载和更新单个 Inode。
+  \item \texttt{bmap}: 将文件块索引映射到物理块号，按需分配直接或间接块。
+\end{itemize}
+高层操作 \texttt{inode\_read} 和 \texttt{inode\_write} 实现了跨越可能不连续的磁盘块的稀疏块读写。
+
+\paragraph{目录与命名空间}
+当前文件系统实现了一个单一的扁平根目录，由 \texttt{sb.root\_inum} 标识。目录项 
+(\texttt{struct dirent}) 将文件名映射到 Inode 编号。辅助函数包括：
+\begin{itemize}
+  \item \texttt{dir\_lookup}: 在根目录中按名称查找 Inode 编号。
+  \item \texttt{dir\_add}: 追加新的目录项。
+  \item \texttt{dir\_remove\_inum}: 按 Inode 编号移除目录项。
+\end{itemize}
+\texttt{fs\_format} 初始化一个新的文件系统：它清除 Inode 和位图块，写入新的超级块，
+创建根目录 Inode，并可选择在根目录中创建一个包含编译进内核的顶级项目 README 内容的
+ \texttt{README.md} 文件。
+
+\paragraph{文件操作与 FD 表}
+在运行时，文件系统层维护一个内存表，最多包含 \texttt{FS\_MAX\_FILES} 个打开的文件 
+(\texttt{FSFileDesc})。返回给用户空间的文件描述符从 \texttt{FS\_FD\_BASE} 开始，
+以便描述符 0, 1, 2 可以保留用于标准输入/输出/错误。
+
+公共 API 包括：
+\begin{itemize}
+  \item \texttt{fs\_init}: 初始化超级块和 FD 表，如果魔数无效则格式化新文件系统。
+  \item \texttt{fs\_create}: 在根目录中创建一个新的普通文件并打开它。
+  \item \texttt{fs\_open}: 按名称打开现有文件。
+  \item \texttt{fs\_read} / \texttt{fs\_write}: 对打开的文件执行基于偏移量的读写，更新文件偏移量。
+  \item \texttt{fs\_close}: 释放文件描述符槽位。
+  \item \texttt{fs\_unlink}: 按名称移除文件，释放其数据和间接块，并清除其 Inode 和目录项。
+  \item \texttt{fs\_trunc}: 将文件大小设置为零而不释放其块（简单的截断语义）。
+  \item \texttt{fs\_list\_root}: 将根目录项枚举到调用者提供的缓冲区中；用于实现 \texttt{ls}。
+\end{itemize}
+
+\subsection{Trap 与中断处理 (trap/)}
+
+Trap 子系统由汇编向量入口和 C 语言处理程序组成。
+
+\paragraph{Trap 入口}
+\texttt{trap/trapentry.S} 中的入口点 \texttt{trap\_vector\_entry} 由 \texttt{trap\_init} 
+安装到 \texttt{mtvec} 中。它：
+\begin{enumerate}
+  \item 在栈上分配 128 字节作为 Trap 帧。
+  \item 将部分通用寄存器 (\texttt{ra}, \texttt{t0--t2}, \texttt{a0--a7}) 保存到该帧中。
+  \item 将 Trap 帧指针作为 \texttt{a0} 传递给 C 处理程序 \texttt{trap\_handler\_c}。
+  \item 恢复保存的寄存器并执行 \texttt{mret} 返回到 \texttt{mepc} 中存储的地址。
+\end{enumerate}
+
+\paragraph{C 级 Trap 处理程序}
+核心逻辑在 \texttt{trap/trap.c} 中。它读取 \texttt{mcause}, \texttt{mepc}, 
+\texttt{mtval}, 和 \texttt{mstatus}，解码事件是异常还是中断，并进行相应分发。
+
+对于 \textbf{环境调用 (Environment call)} 异常（来自用户或 Machine 模式的 ecall），处理程序：
+\begin{itemize}
+  \item 从保存的 \texttt{a7} (Trap 帧中的 \texttt{tf[11]}) 提取系统调用号，
+  从 \texttt{a0--a5} 提取最多六个参数。
+  \item 从 Trap 帧更新当前进程的 \texttt{RegState} 快照，以便随后的 \texttt{fork} 
+  能看到最新的用户上下文。
+  \item 对于 \texttt{SYS\_EXEC}，执行特殊处理：它查找程序名称以获取入口点，
+  更新 \texttt{mepc} 到新入口，并为 \texttt{argc} 和 \texttt{argv} 配置
+   \texttt{a0} 和 \texttt{a1}。此路径绕过通用分发器。
+  \item 对于所有其他系统调用，调用 \texttt{syscall\_dispatch}，将返回值写回 Trap 帧中的 
+  \texttt{a0}，并将 \texttt{mepc} 增加 4 以跳过 \texttt{ecall} 指令。
+\end{itemize}
+
+对于 \textbf{ecall 以外的异常}，处理程序记录诊断信息（启用 Trap 调试时），
+并将该错误视为当前进程的致命错误，调用 \texttt{proc\_exit}。
+
+对于 \textbf{中断}，主要情况有：
+\begin{itemize}
+  \item 机器定时器中断：重新编程 CLINT 定时器以在固定间隔后再次触发，并调用 \texttt{schedule} 
+        执行上下文切换。
+  \item 机器外部中断：通过 \texttt{plic\_claim} 从 PLIC 获取中断号，将 VirtIO 相关中断
+  分发给 \texttt{blk\_intr}，然后通过 \texttt{plic\_complete} 完成中断。
+\end{itemize}
+任何意外的 Trap 都会落入无限 \texttt{wfi} 循环，以便在调试时安全停机。
+
+\paragraph{PLIC 设置}
+\texttt{trap/plic.c} 模块通过以下方式配置 QEMU 的平台级中断控制器：
+\begin{itemize}
+  \item 为 IRQ 1--8 (VirtIO 设备) 设置非零优先级。
+  \item 为 hart 0 启用这些 IRQ。
+  \item 将中断优先级阈值设置为零。
+\end{itemize}
+辅助函数 \texttt{plic\_claim} 和 \texttt{plic\_complete} 与 PLIC claim/complete 
+寄存器交互。
+
+\subsection{系统调用实现 (syscall/)}
+
+系统调用在 \texttt{kernel/syscall/syscall.h} 中定义 ID，并在 
+\texttt{kernel/syscall/syscall.c} 中实现。分发器 \texttt{syscall\_dispatch} 
+使用 switch 语句调用正确的内核函数。
+
+\subsubsection{系统调用表}
+
+表~\ref{tab:syscalls} 总结了当前实现的系统调用。
+
+\begin{longtable}{|c|l|p{0.55\linewidth}|}
+\caption{Lrix 系统调用接口。}
+\label{tab:syscalls} \\
+
+\hline
+ID & 名称 & 描述 \\
+\hline
+\endhead
+1  & SYS\_EXIT     & 终止当前进程并将其转为僵尸状态；如果父进程正在等待，则唤醒它。 \\
+2  & SYS\_GETPID   & 返回调用进程的 PID。 \\
+3  & SYS\_FORK     & 通过复制调用者的 PCB、内核栈和用户堆来创建子进程。 \\
+4  & SYS\_WAIT     & 阻塞直到一个子进程终止；回收其资源并返回其 PID。 \\
+5  & SYS\_SBRK     & 使用 VMM 按请求的增量增长调用进程的堆。 \\
+6  & SYS\_SLEEP    & 基于 CLINT \texttt{mtime} 滴答的忙等待睡眠，使用 \texttt{wfi}。 \\
+7  & SYS\_KILL     & 按 PID 杀死进程；如果找到，立即释放其资源。 \\
+8  & SYS\_UPTIME   & 返回当前 CLINT \texttt{mtime} 值作为单调递增的滴答计数器。 \\
+9  & SYS\_WRITE    & 通过 \texttt{printk} 向 stdout/stderr (fd 1/2) 写字节，或向文件系统支持的描述符写字节。 \\
+10 & SYS\_OPEN     & 按名称打开文件，可选创建标志；返回文件系统文件描述符。 \\
+11 & SYS\_READ     & 从文件系统支持的描述符读取字节到用户缓冲区。 \\
+12 & SYS\_CLOSE    & 关闭文件系统支持的描述符。 \\
+13 & SYS\_LS       & 将根目录条目列出到用户提供的 \texttt{dirent} 数组中。 \\
+14 & SYS\_GETC     & 从 UART 控制台阻塞读取单个字符。 \\
+15 & SYS\_UNLINK   & 移除根目录中的文件，释放其块并清除其 Inode。 \\
+16 & SYS\_EXEC     & 用命名的用户程序替换当前进程镜像；在 Trap 处理程序中特殊处理。 \\
+17 & SYS\_TRUNC    & 按名称截断文件，将其大小设为零但保留其块分配。 \\
+18 & SYS\_PS       & 通过 \texttt{proc\_dump} 转储内核进程列表。 \\
+19 & SYS\_SHUTDOWN & 关闭系统：禁用中断，释放所有进程，并通过 \texttt{wfi} 停机。 \\
+20 & SYS\_SUSPEND  & 将当前进程移至阻塞链表并调度另一个进程；由后台 worker 使用。 \\
+\hline
+\end{longtable}
+
+\subsubsection{Exec 支持}
+
+Exec 风格的程序替换以简单的方式实现。一个小型的静态 \texttt{exec\_table} 
+将程序名称映射到链接进内核镜像的函数入口点，例如：
+\begin{itemize}
+  \item \texttt{"sh"} \(\rightarrow\) \texttt{user\_shell}.
+\end{itemize}
+辅助函数 \texttt{sys\_exec\_lookup} 在处理 \texttt{SYS\_EXEC} 时由 Trap 
+处理程序调用。成功时，处理程序更新 \texttt{mepc} 到新的用户入口点并重新初始化 \texttt{a0} 
+和 \texttt{a1} (\texttt{argc} 和 \texttt{argv})。
+
+\section{用户空间与 Shell (usr/)}
+用户空间代码位于 \texttt{usr/} 下。所有程序使用公共头文件 \texttt{user.h}，
+它导入内核可见的定义（文件系统类型、字符串辅助函数、系统调用号）并声明建立在 
+\texttt{sys\_call.c} 实现的通用 \texttt{sys\_call3} 函数之上的瘦系统调用封装。
+
+\subsection{系统调用封装}
+
+每个用户可见的函数如 \texttt{sys\_write}, \texttt{sys\_open}, \texttt{sys\_fork}, 
+或 \texttt{sys\_shutdown} 都是一个小型的封装，它在寄存器 \texttt{a0--a2} 中设置参数，
+在 \texttt{a7} 中设置系统调用号，并执行 \texttt{ecall}。内核的 Trap 处理程序随后
+分发到相应的系统调用实现。
+
+\subsection{Shell 概览}
+
+主要的用户程序是在 \texttt{usr/shell.c} 中实现的交互式 Shell。它作为一个常规进程运行，
+并仅通过系统调用与内核交互。
+
+Shell 的架构包括：
+\begin{itemize}
+  \item 一个简单的行编辑器，使用 \texttt{sys\_getc} 读取字符，本地处理退格键，并通过 
+  \texttt{sys\_write} 回显输入。
+  \item 一个标记化例程，将命令行分割成最多八个以空格分隔的参数 (\texttt{argv})。
+  \item 一组直接用 C 实现的内置命令，无需衍生外部程序。
+  \item 通过临时文件名 (\texttt{\_\_pipe.tmp}) 对“管道”的极简支持，用于在简单场景下
+  将一个命令的输出传递给另一个命令。
+\end{itemize}
+
+\subsection{支持的 Shell 命令}
+
+Shell 目前支持以下内置命令：
+
+\begin{itemize}
+  \item \textbf{\texttt{ls}}: 通过调用 \texttt{sys\_ls} 并打印每个返回的 \texttt{dirent} 
+                              名称来列出根目录中的文件。
+  \item \textbf{\texttt{cat FILE}}: 使用 \texttt{sys\_open} 打开文件，使用 
+                                    \texttt{sys\_read} 读取内容，并写入标准输出。
+                                    当在管道模式下不带参数调用时，它从临时管道文件读取。
+  \item \textbf{\texttt{read FILE}}: \texttt{cat FILE} 的别名。
+  \item \textbf{\texttt{echo ARGS...}}: 打印以空格分隔并以换行符结尾的参数。
+  \item \textbf{\texttt{touch F}}: 如果文件不存在则创建空文件，
+                                   尝试 \texttt{sys\_open(F, 0)}，
+                                  失败则 \texttt{sys\_open(F, 1)}。
+  \item \textbf{\texttt{rm F}}: 使用 \texttt{sys\_unlink} 移除文件；
+                                失败时打印错误消息。
+  \item \textbf{\texttt{mv A B}}: 移动（重命名）文件，通过将数据从 A 复制到 B 然后
+                                  unlink A。如果 B 存在，则先 unlink 并重新创建。
+  \item \textbf{\texttt{pwd}}: 打印当前目录，由于文件系统目前是扁平的，始终为 \texttt{/}。
+  \item \textbf{\texttt{mkdir D}}, \textbf{\texttt{rmdir D}}: 打印信息性消息，
+                                                              表明不支持分层目录。
+  \item \textbf{\texttt{write F TEXT...}}: (重)写文件。该命令将文件名后的所有参数连接
+                                          成一个空格分隔的字符串并写入文件，先通过 
+                                          \texttt{sys\_trunc} 截断文件。当与管道一起使用时，
+                                          也可以将临时管道文件的内容写入目标文件。
+  \item \textbf{\texttt{fork}}: \texttt{fork} 系统调用的演示。父进程打印子进程的 PID 
+                                然后调用 \texttt{sys\_wait} 进行同步。子进程打印消息并退出。
+  \item \textbf{\texttt{bg}}: 创建一个简单的后台 worker 进程，通过 fork 并在子进程中
+                              调用 \texttt{sys\_suspend}，将其移入阻塞链表而不消耗 CPU。
+  \item \textbf{\texttt{kill PID}}: 通过 \texttt{sys\_kill} 按 PID 杀死进程。
+  \item \textbf{\texttt{ps}}: 通过调用 \texttt{SYS\_PS} 系统调用列出进程，
+                              该调用在内核中调用 \texttt{proc\_dump}。
+  \item \textbf{\texttt{help}}: 打印所有内置命令的摘要及每个命令的简短描述。
+  \item \textbf{\texttt{exit}}: 通过调用 \texttt{sys\_shutdown} 关闭系统。
+                                Shell 打印有关退出 QEMU 模拟器的提示。
+  \item \textbf{\texttt{halt}}: \texttt{exit} 的同义词，直接调用 
+                                \texttt{sys\_shutdown} 而不显示额外消息。
+\end{itemize}
+
+通过这些命令，Shell 演练了大部分内核子系统：
+文件系统操作 (\texttt{ls}, \texttt{cat}, \texttt{write}, \texttt{rm}, \texttt{mv}, 
+\texttt{touch})、进程控制 (\texttt{fork}, \texttt{bg}, \texttt{kill}, \texttt{ps}) 
+以及关机路径 (\texttt{exit}, \texttt{halt})。
+
+\section{总结}
+Lrix 展示了从裸机 RISC-V 启动到交互式用户 Shell 的紧凑而完整的路径。
+尽管体积小巧，它涵盖了许多经典的操作系统概念：基于页的物理分配器、极简的虚拟内存抽象、
+带有阻塞和僵尸状态的轮转进程调度、基于 VirtIO 块存储的简单 inode 文件系统、
+绑定到 RISC-V CSR 和 PLIC 的 Trap 与中断子系统，以及供用户空间程序使用的系统调用接口。
+
+由于设计特意保持直观且代码库完全自包含，Lrix 可以作为实验和扩展的良好基础。但是我还是得
+强调 Lrix 只运行在 Machine Mode下。
+
+\printbibliography
+
+\end{document}

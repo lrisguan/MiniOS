@@ -1,0 +1,800 @@
+\documentclass[12pt]{article}
+\usepackage[margin=1.9cm]{geometry}
+\usepackage{times}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{longtable}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{fontspec}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage[backend=biber,style=numeric,doi=false,isbn=false,url=true]{biblatex}
+\renewcommand{\UrlFont}{\rmfamily}
+
+\addbibresource{./lrixref.bib}
+
+\setmainfont{TeX Gyre Termes}
+%\setsansfont{Arial}
+\setmonofont{DejaVu Sans Mono}
+\makeatletter
+\newcommand\dlmu[2][4cm]{\hskip1pt\underline{\hb@xt@ #1{\hss#2\hss}}\hskip3pt}
+\makeatother
+
+\title{\textbf{Lrix: A scratch RISC-V Operating System}}
+\author{
+      \Large Project: Lrix\\
+      \Large GitHub: \url{https://github.com/lrisguan/Lrix} \\
+      }
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+
+\begin{abstract}
+Lrix is a scratch educational operating system targeting the RISC-V architecture and
+QEMU's \texttt{virt} machine running under \textbf{Machine Mode}. That's why I 
+call it scratch(In the future maybe I will fix this issue). This report 
+gives a concise technical overview of the kernel and user space design, 
+focusing on memory management, process management, filesystem, trap and 
+interrupt handling, system call interface, and the built-in shell.
+\end{abstract}
+
+\section{Introduction}
+Lrix is a small teaching-oriented OS implemented in C and RISC-V assembly.
+It boots on the QEMU \texttt{riscv64 virt} platform, uses a simple UART driver
+for console I/O, and provides a minimal UNIX-like process and file abstraction.
+The top-level \texttt{Makefile} builds a kernel image and user programs, and
+runs them inside QEMU using a VirtIO block device as backing storage.
+Note: When developing Lrix, I referred to \cite{riscv}, \cite{riscv:priv}, 
+\cite{riscv:user}\cite{xv6-riscv}, \cite{xv6-riscv}, \cite{virtio}, \cite{virtio-1.1}
+
+
+The kernel entry point \texttt{kmain} performs the following high-level steps:
+\begin{enumerate}
+  \item Initialize UART for serial output.
+  \item Initialize the trap/interrupt subsystem and the PLIC.
+  \item Initialize the physical page allocator and virtual memory manager.
+  \item Initialize the scheduler and create an idle process.
+  \item Initialize the VirtIO block driver and the simple inode-based filesystem.
+  \item Create the initial user process running the shell, then enable interrupts
+        and idle with \texttt{wfi} while timer interrupts drive scheduling.
+\end{enumerate}
+
+\section{Kernel Subsystems}
+This section summarizes each major kernel module under \texttt{kernel/}, with emphasis
+on memory management, process management, filesystem, and trap handling.
+
+\subsection{Boot and Entry (boot/)}
+
+The bootstrap code in \texttt{boot/start.S} is responsible for low-level CPU
+initialization:
+\begin{itemize}
+  \item Set the initial stack pointer to the linker-provided \texttt{\_stack\_top}.
+  \item Zero the BSS segment by iterating from \texttt{\_bss\_start} to
+        \texttt{\_bss\_end}.
+  \item Call the C entry point \texttt{kmain}, and if it ever returns, loop forever.
+\end{itemize}
+This code runs in machine mode and prepares a clean C environment for the kernel.
+
+\subsection{UART and Logging (uart/, include/log.h)}
+
+The UART driver in \texttt{uart/uart.c} implements interrupt I/O for the NS16550-compatible
+UART mapped at \texttt{0x10000000} on QEMU's \texttt{virt} machine. (For the interrupt
+I/O, you can enable compile flag \textbf{TRAP\_DEBUG} to see).
+It provides:
+\begin{itemize}
+  \item \texttt{uart\_init}: configure the UART in 8N1 mode.
+  \item \texttt{uart\_putc}, \texttt{uart\_getc}, and \texttt{uart\_getc\_blocking} for
+        basic character I/O.
+  \item \texttt{uart\_getline} and a small scanf-like \texttt{scank} to parse user input.
+  \item \texttt{printk}: a minimal formatted printing routine supporting standard
+        integer, string, and pointer formats.
+\end{itemize}
+The header \texttt{include/log.h} then builds on top of \texttt{printk} and ANSI escape
+codes to offer colored logging macros such as \texttt{INFO}, \texttt{WARNING}, and
+\texttt{ERROR} used throughout the kernel.
+
+\subsection{String Library (string/)}
+
+The \texttt{string/string.c} file implements a small subset of libc string and
+memory functions used in the kernel and user space, including \texttt{memset},
+\texttt{memcpy}, \texttt{memmove}, \texttt{memcmp}, \texttt{strlen}, \texttt{strcmp},
+and \texttt{strncmp}. This avoids depending on an external C library.
+
+\subsection{Low-Level RISC-V Helpers (include/riscv.h, include/types.h)}
+
+The header \texttt{include/riscv.h} contains inline assembly helpers for common
+RISC-V CSRs, in particular \texttt{intr\_on} and \texttt{intr\_off}, which set or
+clear the machine interrupt enable (MIE) bit in \texttt{mstatus}. This is used
+pervasively in the scheduler and trap code to delimit critical sections.
+
+The header \texttt{include/types.h} defines basic types and the \texttt{RegState}
+structure, which holds the RISC-V register context (general-purpose registers,
+\texttt{sepc}, \texttt{sp}, and \texttt{mstatus}) used by the scheduler and context
+switch mechanism.
+
+\newpage
+\begin{longtable}{|c|l|l|p{0.55\linewidth}|}
+\caption{Description of RegisterState Structure Fields}
+\label{tab:registerstate_en}\\ 
+\hline
+Field Name & Register Alias & Field Type & Description               \\
+\hline
+\endfirsthead 
+\caption[]{Description of RegisterState Structure Fields (continued)} \\
+\hline
+Field Name & Register Alias & Field Type & Description               \\
+\hline
+\endhead
+\hline
+\endfoot
+\hline
+\endlastfoot
+x1         & ra             & uint64\_t   & Return Address            \\
+\hline
+x5         & t0             & uint64\_t   & Temporary Register 0      \\
+\hline
+x6         & t1             & uint64\_t   & Temporary Register 1      \\
+\hline
+x7         & t2             & uint64\_t   & Temporary Register 2      \\
+\hline
+x8         & s0/fp          & uint64\_t   & Saved Register 0 / Frame Pointer \\
+\hline
+x9         & s1             & uint64\_t   & Saved Register 1          \\
+\hline
+x10        & a0             & uint64\_t   & Argument/Return Value Register 0 \\
+\hline
+x11        & a1             & uint64\_t   & Argument/Return Value Register 1 \\
+\hline
+x12        & a2             & uint64\_t   & Argument Register 2       \\
+\hline
+x13        & a3             & uint64\_t   & Argument Register 3       \\
+\hline
+x14        & a4             & uint64\_t   & Argument Register 4       \\
+\hline
+x15        & a5             & uint64\_t   & Argument Register 5       \\
+\hline
+x16        & a6             & uint64\_t   & Argument Register 6       \\
+\hline
+x17        & a7             & uint64\_t   & Argument Register 7       \\
+\hline
+x18        & s2             & uint64\_t   & Saved Register 2          \\
+\hline
+x19        & s3             & uint64\_t   & Saved Register 3          \\
+\hline
+x20        & s4             & uint64\_t   & Saved Register 4          \\
+\hline
+x21        & s5             & uint64\_t   & Saved Register 5          \\
+\hline
+x22        & s6             & uint64\_t   & Saved Register 6          \\
+\hline
+x23        & s7             & uint64\_t   & Saved Register 7          \\
+\hline
+x24        & s8             & uint64\_t   & Saved Register 8          \\
+\hline
+x25        & s9             & uint64\_t   & Saved Register 9          \\
+\hline
+x26        & s10            & uint64\_t   & Saved Register 10         \\
+\hline
+x27        & s11            & uint64\_t   & Saved Register 11         \\
+\hline
+x28        & t3             & uint64\_t   & Temporary Register 3      \\
+\hline
+x29        & t4             & uint64\_t   & Temporary Register 4      \\
+\hline
+x30        & t5             & uint64\_t   & Temporary Register 5      \\
+\hline
+x31        & t6             & uint64\_t   & Temporary Register 6      \\
+\hline
+sepc       & -              & uint64\_t   & Exception Return Address  \\
+\hline
+sp         & -              & uint64\_t   & Stack Pointer             \\
+\hline
+mstatus    & -              & uint64\_t   & Machine Status Register   \\
+\hline
+\end{longtable}
+
+\subsection{Physical Memory Management (mem/kmem.c)}
+
+Physical memory allocation is performed by a simple page-based allocator in
+\texttt{mem/kmem.c}. The allocator is initialized by \texttt{kinit}, which is passed
+a heap range defined in the linker script.
+
+The implementation maintains:
+\begin{itemize}
+  \item A \texttt{Page} descriptor array, placed at the beginning of the heap.
+  \item A singly-linked free list of \texttt{Page} objects.
+  \item Counters for total, free, and used pages.
+\end{itemize}
+Key operations are:
+\begin{itemize}
+  \item \textbf{Initialization}: the page descriptor array occupies an integral number
+        of pages at the start of the heap; those pages are marked used, and the remaining
+        pages are inserted into the free list.
+  \item \textbf{Allocation (kalloc)}: pop a \texttt{Page} from the free list, mark it
+        used, compute its physical address from its index, and zero the page before
+        returning it to callers.
+  \item \textbf{Free (kfree)}: validate the address and alignment, map it back to a
+        \texttt{Page} descriptor, guard against double free, and push it back onto
+        the free list.
+\end{itemize}
+Diagnostic helpers expose statistics (total/free/used pages) and can print a summary
+of the allocator state.
+
+\subsection{Virtual Memory Management (mem/vmm.c)}
+The virtual memory manager implements a real RISC-V Sv39 page-table hierarchy
+and is responsible both for basic kernel mappings (RAM and MMIO) and for on-demand
+allocation of user heap pages.
+
+\paragraph{Sv39 Page-Table Layout}
+Lrix uses the standard three-level Sv39 scheme:
+\begin{itemize}
+  \item Virtual addresses are split into VPN2 (bits 38--30), VPN1 (29--21),
+        VPN0 (20--12), and a 4~KB page offset (11--0).
+  \item Each page table page is 4~KB and holds 512 64-bit entries.
+  \item Leaf PTEs encode a physical page number plus Sv39 flags (V/R/W/X/U/A/D).
+  \item Non-leaf PTEs (for intermediate levels) are marked valid but have
+        all R/W/X/A/D bits cleared, as required by the Sv39 specification.
+\end{itemize}
+The kernel maintains a single root page table (level-2) called
+\texttt{kernel\_pd}, along with its physical address \texttt{kernel\_pd\_phys}.
+All page-table memory is allocated from the physical allocator (\texttt{kalloc})
+and explicitly zeroed before use.
+
+\paragraph{Initialization and Identity Mappings}
+The entry point \texttt{vmm\_init} performs the following steps:
+\begin{itemize}
+  \item Allocate and zero the root level-2 page table, store its virtual and
+        physical addresses in \texttt{kernel\_pd} and \texttt{kernel\_pd\_phys}.
+  \item Run a minimal self-test (\texttt{vmm\_self\_test}) that maps a test
+        virtual address to a freshly allocated page, verifies translation via
+        \texttt{vmm\_translate}, then unmaps it and confirms the translation
+        disappears.
+  \item Build identity mappings for the key regions of the \texttt{virt} machine:
+        \begin{itemize}
+          \item Main RAM: \texttt{0x80000000}--\texttt{0x80000000 + 128MB},
+                mapped as readable/writable and user-accessible
+                (\texttt{VMM\_P\_RW | VMM\_P\_USER}) so that both kernel and
+                user code/data/stacks continue to work when paging is enabled.
+          \item UART MMIO at \texttt{0x10000000} and the VirtIO MMIO window
+                \texttt{[VIRTIO\_MMIO\_START, VIRTIO\_MMIO\_END)} mapped as
+                kernel-only read/write.
+          \item CLINT timer at \texttt{0x02000000}--\texttt{0x02010000},
+                mapped for kernel read/write.
+          \item PLIC MMIO region starting at \texttt{PLIC\_BASE}, with a small
+                identity-mapped window for interrupt controller registers.
+        \end{itemize}
+\end{itemize}
+These identity mappings ensure that when Sv39 translation is turned on,
+the kernel can continue to use the same virtual addresses for code, data,
+heap, and device registers.
+
+\paragraph{Activating Sv39 Paging}
+After initialization, \texttt{kmain} calls \texttt{vmm\_activate} to enable hardware
+paging:
+\begin{itemize}
+  \item Compute the page-table physical page number (PPN) as
+        \texttt{kernel\_pd\_phys >> 12}.
+  \item Construct an Sv39 \texttt{satp} value with MODE=8 (Sv39), ASID=0,
+        and the PPN in the low bits.
+  \item Write this value into the \texttt{satp} CSR and execute
+        \texttt{sfence.vma} to flush stale TLB entries.
+\end{itemize}
+For portability, two stub hooks \texttt{arch\_set\_cr3} and
+\texttt{arch\_enable\_paging} are still present but do nothing on RISC-V;
+all real activation is performed via \texttt{satp}.
+
+\paragraph{Mapping, Unmapping, and Translation}
+Core operations are implemented on top of a helper that walks down the
+three-level page tables:
+\begin{itemize}
+  \item \textbf{\texttt{get\_next\_level}} takes a page-table pointer, an index,
+        and an \texttt{alloc} flag. If the entry is invalid and allocation is
+      enabled, it allocates a new page-table page, installs a non-leaf PTE
+        (valid, no R/W/X/A/D), and returns a pointer to the next-level table.
+        For an already valid entry, it interprets the PTE as a page-table
+        pointer by converting the PPN back to a (identity-mapped) virtual address.
+  \item \textbf{\texttt{vmm\_map}}:
+        \begin{itemize}
+          \item Requires page-aligned virtual and physical addresses.
+          \item Walks L2$\rightarrow$L1$\rightarrow$L0, allocating intermediate
+                tables as needed.
+          \item Translates abstract VMM flags (\texttt{VMM\_P\_*}) into Sv39
+                PTE bits (V/R/W/X/U/A/D). For now, \texttt{VMM\_P\_RW} implies
+                R/W/X so that both code and data pages work without a separate
+                EXEC flag, and A/D are set eagerly.
+          \item Installs a leaf PTE at L0 with the chosen physical address and
+                flags.
+        \end{itemize}
+  \item \textbf{\texttt{vmm\_map\_page}}:
+        \begin{itemize}
+          \item Allocates a fresh physical page via \texttt{kalloc}, zeroes it,
+                and then calls \texttt{vmm\_map} to map it at the requested
+                virtual address.
+        \end{itemize}
+  \item \textbf{\texttt{vmm\_unmap}}:
+        \begin{itemize}
+          \item Walks the page tables without allocating intermediate levels.
+          \item If a valid leaf PTE is found, clears it and, optionally, frees
+                the underlying physical page back to the allocator when
+                \texttt{free\_phys} is non-zero.
+          \item Does not currently reclaim now-empty intermediate page tables;
+                this keeps the implementation simple at the cost of a small
+                memory overhead.
+        \end{itemize}
+  \item \textbf{\texttt{vmm\_translate}}:
+        \begin{itemize}
+          \item Performs a software page-table walk for a given virtual address
+                and, if a valid PTE is found, returns a pointer to the
+                corresponding physical address (PPN combined with the original
+                page offset).
+          \item Used primarily for debugging and the built-in self-test.
+        \end{itemize}
+\end{itemize}
+Additional helpers \texttt{vmm\_get\_page\_directory},
+\texttt{vmm\_set\_page\_directory}, and \texttt{vmm\_get\_pd\_phys} expose the
+current kernel root page table, laying the groundwork for future
+per-process address spaces even though the current system still uses a
+single global Sv39 page table.
+
+\paragraph{User Heap Allocation on Sv39}
+User heaps are implemented on top of the Sv39 mapper but keep a very simple
+layout:
+\begin{itemize}
+  \item Each process is assigned a per-PID heap region starting at
+        \(\text{HEAP\_USER\_BASE} + \text{pid} \times \text{PER\_PROC\_HEAP}\),
+        where \texttt{HEAP\_USER\_BASE} is \texttt{0x80400000} and
+        \texttt{PER\_PROC\_HEAP} is 8~KB.
+  \item The \texttt{SYS\_SBRK} implementation (\texttt{sys\_sbrk}) in
+        \texttt{syscall.c} grows this region by calling \texttt{vmm\_map\_page}
+        for each additional 4~KB page, always with \texttt{VMM\_P\_RW | VMM\_P\_USER}
+        flags so that user code can read/write the newly mapped memory.
+  \item The combination of a global Sv39 page table and per-PID heap windows
+        provides contiguous virtual heaps per process while still keeping the
+        overall design simple (no process-specific \texttt{satp} switching yet).
+\end{itemize}
+
+\subsection{Process Management and Scheduling (proc/)}
+
+Process management is implemented in \texttt{proc/proc.c}. The core data structure
+is the process control block (PCB), which contains:
+\begin{itemize}
+  \item Process identifier (PID) and parent PID (PPID).
+  \item Scheduling state (READY, RUNNING, BLOCKED, TERMINATED) and priority.
+  \item Kernel stack top address and saved register context (\texttt{RegState}).
+  \item Per-process heap base \texttt{brk\_base} and size \texttt{brk\_size}.
+  \item A process name for debugging and shell output.
+\end{itemize}
+
+\begin{longtable}{|l|l|p{9cm}|}
+  \caption{Definition of ProcessControlBlock (PCB) Structure}
+  \label{tab:pcb_en} \\
+  \hline
+  \textbf{Member Name} & \textbf{Data Type} & \textbf{Description} \\
+  \hline
+  \endfirsthead  % 第一页表头结束
+
+  \caption[]{Definition of ProcessControlBlock (PCB) Structure (Continued)} \\
+  \hline
+  \textbf{Member Name} & \textbf{Data Type} & \textbf{Description} \\
+  \hline
+  \endhead  % 后续页面表头
+
+  \hline
+  \multicolumn{3}{r}{Continued on next page} \\
+  \endfoot  % 每页表尾（非最后一页）
+
+  \hline
+  \endlastfoot  % 最后一页表尾
+
+  pid            & int         & Process unique identifier \\
+  \hline
+  pstat          & ProcState   & Process running state (e.g., ready, running, blocked) \\
+  \hline
+  name[20]       & char        & Process name (maximum 20 characters) \\
+  \hline
+  prior          & int         & Process priority (lower value indicates higher priority) \\
+  \hline
+  entrypoint     & uint64\_t    & Process entry point (starting instruction address) \\
+  \hline
+  stacktop       & uint64\_t    & Virtual address of the process stack top \\
+  \hline
+  ppid           & int         & Parent process ID (0 for kernel or init process) \\
+  \hline
+  brk\_base      & void *      & Base address of the program break (heap starting address) \\
+  \hline
+  brk\_size      & uint64\_t    & Allocated heap size in bytes \\
+  \hline
+  cpu\_time      & uint64\_t    & Total CPU time consumed by the process \\
+  \hline
+  remain\_time   & uint64\_t    & Remaining time slice for the process scheduling \\
+  \hline
+  arriv\_time    & uint64\_t    & Process arrival time in the system \\
+  \hline
+  regstat        & RegState    & Saved register state for context switching \\
+  \hline
+  next           & PCB *       & Linked list pointer for process queue management \\
+  \hline
+\end{longtable}
+
+Global variables track the current process, an idle process, a ready queue, and
+linked lists for blocked and zombie processes.
+
+\paragraph{Idle Process and Scheduler Initialization}
+\texttt{scheduler\_init} initializes the ready queue and creates an \emph{idle} process
+with PID~0, its own kernel stack, and entry function \texttt{idle\_entry}. The idle
+process simply enables interrupts and executes \texttt{wfi} in a loop, relinquishing
+CPU until a timer interrupt arrives.
+
+\paragraph{Process Creation}
+Two creation paths exist:
+\begin{itemize}
+  \item \textbf{\texttt{proc\_create}} is used by the kernel to create the initial shell
+        process. It allocates a PCB and a kernel stack, initializes the register
+        state so that returning from the first context switch jumps into the given
+        entry point, and enqueues the process onto the ready queue.
+  \item \textbf{\texttt{proc\_fork}} implements the \texttt{fork} system call. It clones
+        the parent's PCB and kernel stack, adjusts the child's stack pointer to
+        mirror the parent's frame layout, sets the child's \texttt{a0} register to~0
+        (so the child sees \texttt{fork()} return 0), and deep-copies the user heap
+        using \texttt{vmm\_map\_page} and \texttt{memcpy}. The child is then enqueued
+        as READY.
+\end{itemize}
+
+\paragraph{Exit, Wait, and Zombies}
+When a process calls \texttt{exit}, \texttt{proc\_exit} marks it as TERMINATED,
+links it into \texttt{zombie\_list}, and wakes its parent if the parent is blocked in
+\texttt{wait}. \texttt{proc\_wait\_and\_reap} searches \texttt{zombie\_list} for a child
+of the calling process, frees its kernel stack, unmaps its heap pages via
+\texttt{vmm\_unmap}, frees the PCB, and returns the child's PID. Orphaned zombies
+with \texttt{ppid == 0} are eventually reclaimed by \texttt{zombies\_free}, which is called
+opportunistically by the scheduler.
+
+\paragraph{Scheduling Algorithm}
+The \texttt{schedule} function provides a simple round-robin style scheduler:
+\begin{itemize}
+  \item It dequeues the next READY process from \texttt{ready\_queue}. If none is
+        available and the current process is still RUNNING and not the idle process,
+        the current process continues to run. Otherwise, the scheduler selects the
+        idle process.
+  \item The outgoing RUNNING process (if any) is downgraded to READY and re-enqueued
+        (except for the idle process). TERMINATED processes remain on the zombie list.
+  \item A context switch is performed via the assembly routine \texttt{switch\_context},
+        saving the old \texttt{RegState} and restoring the new one.
+  \item After returning from a context switch, the scheduler invokes
+        \texttt{zombies\_free} to clean up any orphaned zombies.
+\end{itemize}
+The scheduler is driven by periodic machine timer interrupts, which reprogram the
+CLINT timer and call \texttt{schedule} from the trap handler.
+
+\paragraph{Additional Process Operations}
+The process subsystem also provides:
+\begin{itemize}
+  \item \texttt{proc\_dump}: print a snapshot of all processes (used by the \texttt{ps}
+        system call).
+  \item \texttt{proc\_suspend\_current}: move the current process into the blocked list
+        and \texttt{schedule} another process; used by the shell's \texttt{bg} command.
+  \item \texttt{proc\_kill}: kill a process by PID, searching ready, blocked, and
+        zombie lists, freeing resources immediately.
+  \item \texttt{proc\_shutdown\_all}: used during system shutdown to free all non-idle
+        processes from ready, blocked, and zombie lists.
+\end{itemize}
+
+\subsection{Filesystem and Block Device (fs/, fs/blk.c)}
+
+Filesystem support is built on top of a VirtIO block driver and a minimal
+inode-based filesystem.
+
+\paragraph{VirtIO Block Driver}
+The driver in \texttt{fs/blk.c} probes the MMIO range for VirtIO devices, looking
+for a device with \texttt{DEVICE\_ID == 2} (block). It supports both VirtIO MMIO
+version~1 and version~2 by configuring the appropriate queue registers.
+
+Each I/O request uses a small virtqueue with three descriptors:
+\begin{enumerate}
+  \item A request header describing the operation (read/write) and target sector.
+  \item A data buffer for one 512-byte sector.
+  \item A status byte written by the device.
+\end{enumerate}
+Requests are submitted by updating the available ring and notifying the device
+through the MMIO \texttt{QUEUE\_NOTIFY} register. Completion is detected by
+polling the used ring index; interrupts from the device are handled by \texttt{blk\_intr}
+via the trap and PLIC code.
+
+The public interface exports \texttt{blk\_read\_sector} and \texttt{blk\_write\_sector},
+which are used exclusively by the filesystem layer.
+
+\paragraph{On-Disk Layout and Inodes}
+The filesystem in \texttt{fs/fs.c} and \texttt{fs/fs.h} uses a very small fixed-size
+layout over a 64~KB disk image:
+\begin{itemize}
+  \item Block~0: superblock (\texttt{struct superblock}).
+  \item Blocks~1--4: inode table (\texttt{struct dinode}).
+  \item Block~5: free block bitmap.
+  \item Blocks~6--127: data blocks.
+\end{itemize}
+Each inode (\texttt{struct dinode}) contains a type (free, regular file, directory),
+link count, file size, an array of 10 direct block addresses, and a single indirect
+block pointer. The indirect block holds an array of data block addresses, so the
+maximum number of blocks per file is
+\(\text{MAXFILE} = \text{NDIRECT} + \text{NINDIRECT}\).
+
+\paragraph{Block and Inode Management}
+Internal helpers include:
+\begin{itemize}
+  \item \texttt{b\_read} / \texttt{b\_write}: wrappers around the VirtIO driver for
+        512-byte sectors.
+  \item \texttt{balloc} / \texttt{b\_free}: allocate and free data blocks by manipulating
+        the bitmap in the bitmap block.
+  \item \texttt{read\_dinode} / \texttt{write\_dinode}: load and update individual inodes
+        given their inode number.
+  \item \texttt{bmap}: map a file block index to a physical block number, allocating
+        direct or indirect blocks as needed.
+\end{itemize}
+Higher-level operations \texttt{inode\_read} and \texttt{inode\_write} implement
+sparse block-wise reads and writes across possibly non-contiguous disk blocks.
+
+\paragraph{Directory and Namespace}
+The current filesystem implements a single flat root directory, identified by
+\texttt{sb.root\_inum}. Directory entries (\texttt{struct dirent}) map file names to
+inode numbers. Helper functions include:
+\begin{itemize}
+  \item \texttt{dir\_lookup}: find an inode number by name in the root directory.
+  \item \texttt{dir\_add}: append a new directory entry.
+  \item \texttt{dir\_remove\_inum}: remove a directory entry by inode number.
+\end{itemize}
+\texttt{fs\_format} initializes a fresh filesystem: it clears inode and bitmap blocks,
+writes a new superblock, creates the root directory inode, and optionally creates a
+\texttt{README.md} file in the root directory containing the top-level project
+README, which is compiled into the kernel as static data.
+
+\paragraph{File Operations and FD Table}
+At runtime, the filesystem layer maintains an in-memory table of at most
+\texttt{FS\_MAX\_FILES} open files (\texttt{FSFileDesc}). File descriptors returned
+to user space start at \texttt{FS\_FD\_BASE} so that descriptors 0, 1, 2 can be
+reserved for standard input/output/error.
+
+The public API includes:
+\begin{itemize}
+  \item \texttt{fs\_init}: initialize the superblock and FD table, formatting a new
+        filesystem if the magic number is invalid.
+  \item \texttt{fs\_create}: create a new regular file in the root directory and open it.
+  \item \texttt{fs\_open}: open an existing file by name.
+  \item \texttt{fs\_read} / \texttt{fs\_write}: perform offset-based reads and writes
+        on an open file, updating the file offset.
+  \item \texttt{fs\_close}: release a file descriptor slot.
+  \item \texttt{fs\_unlink}: remove a file by name, freeing its data and indirect blocks
+        and clearing its inode and directory entry.
+  \item \texttt{fs\_trunc}: set a file's size to zero without freeing its blocks
+        (simple truncate semantics).
+  \item \texttt{fs\_list\_root}: enumerate root directory entries into a caller-provided
+        buffer; this is used to implement \texttt{ls}.
+\end{itemize}
+
+\subsection{Trap and Interrupt Handling (trap/)}
+
+The trap subsystem consists of an assembly vector entry and a C-level handler.
+
+\paragraph{Trap Entry}
+The entry point \texttt{trap\_vector\_entry} in \texttt{trap/trapentry.S} is installed
+into \texttt{mtvec} by \texttt{trap\_init}. It:
+\begin{enumerate}
+  \item Allocates 128 bytes on the stack as a trap frame.
+  \item Saves a subset of general-purpose registers (\texttt{ra}, \texttt{t0--t2},
+        \texttt{a0--a7}) into this frame.
+  \item Passes the trap frame pointer in \texttt{a0} to the C handler
+        \texttt{trap\_handler\_c}.
+  \item Restores the saved registers and executes \texttt{mret} to return to the
+        address stored in \texttt{mepc}.
+\end{enumerate}
+
+\paragraph{C-Level Trap Handler}
+The core logic is in \texttt{trap/trap.c}. It reads \texttt{mcause}, \texttt{mepc},
+\texttt{mtval}, and \texttt{mstatus}, decodes whether the event is an exception or an
+interrupt, and dispatches accordingly.
+
+For \textbf{environment call} exceptions (ecall from user or machine mode), the handler:
+\begin{itemize}
+  \item Extracts the system call number from the saved \texttt{a7} (
+        \texttt{tf[11]} in the trap frame) and up to six arguments from
+        \texttt{a0--a5}.
+  \item Updates the current process's \texttt{RegState} snapshot from the trap frame so
+        that a subsequent \texttt{fork} sees the latest user context.
+  \item For \texttt{SYS\_EXEC}, performs special handling: it looks up the program
+        name to get an entry point, updates \texttt{mepc} to the new entry, and configures
+        \texttt{a0} and \texttt{a1} for \texttt{argc} and \texttt{argv}. This path
+        bypasses the generic dispatcher.
+  \item For all other syscalls, calls \texttt{syscall\_dispatch}, writes the return
+        value back into \texttt{a0} in the trap frame, and advances \texttt{mepc} by 4
+        to skip the \texttt{ecall} instruction.
+\end{itemize}
+
+For \textbf{exceptions other than ecall}, the handler logs diagnostic information
+(when trap debugging is enabled) and treats the fault as fatal to the current
+process by calling \texttt{proc\_exit}.
+
+For \textbf{interrupts}, the main cases are:
+\begin{itemize}
+  \item Machine timer interrupt: reprogram the CLINT timer to fire again after a fixed
+        interval and invoke \texttt{schedule} to perform a context switch.
+  \item Machine external interrupt: claim the interrupt number from the PLIC via
+        \texttt{plic\_claim}, dispatch VirtIO-related interrupts to \texttt{blk\_intr},
+        and then complete the interrupt via \texttt{plic\_complete}.
+\end{itemize}
+Any unexpected traps fall into an infinite \texttt{wfi} loop to halt the CPU for
+safety when debugging.
+
+\paragraph{PLIC Setup}
+The \texttt{trap/plic.c} module configures QEMU's platform-level interrupt controller
+by:
+\begin{itemize}
+  \item Setting non-zero priority for IRQ~1--8 (VirtIO devices).
+  \item Enabling these IRQs for hart~0.
+  \item Setting the interrupt priority threshold to zero.
+\end{itemize}
+Helper functions \texttt{plic\_claim} and \texttt{plic\_complete} interact with the PLIC
+claim/complete registers.
+
+\subsection{System Call Implementation (syscall/)}
+
+System calls are defined by numeric IDs in \texttt{kernel/syscall/syscall.h} and
+implemented in \texttt{kernel/syscall/syscall.c}. The dispatcher \texttt{syscall\_dispatch}
+uses a switch statement to invoke the correct kernel function.
+
+\subsubsection{System Call Table}
+
+Table~\ref{tab:syscalls} summarizes the currently implemented system calls.
+
+\begin{longtable}{|c|l|p{0.55\linewidth}|}
+\caption{Lrix system call interface.}
+\label{tab:syscalls} \\
+
+\hline
+ID & Name & Description \\
+\hline
+\endhead
+1  & SYS\_EXIT     & Terminate the current process and turn it into a zombie; parent is woken if waiting. \\
+2  & SYS\_GETPID   & Return the PID of the calling process. \\
+3  & SYS\_FORK     & Create a child process by duplicating the caller's PCB, kernel stack, and user heap. \\
+4  & SYS\_WAIT     & Block until a child terminates; reap its resources and return its PID. \\
+5  & SYS\_SBRK     & Grow the calling process's heap by a requested increment using the VMM. \\
+6  & SYS\_SLEEP    & Busy-wait sleep based on CLINT \texttt{mtime} ticks, using \texttt{wfi}. \\
+7  & SYS\_KILL     & Kill a process by PID; immediately free its resources if found. \\
+8  & SYS\_UPTIME   & Return the current CLINT \texttt{mtime} value as a monotonically increasing tick counter. \\
+9  & SYS\_WRITE    & Write bytes either to stdout/stderr (fd 1/2) via \texttt{printk}, or to a filesystem-backed descriptor. \\
+10 & SYS\_OPEN     & Open a file by name with optional create flag; returns a filesystem file descriptor. \\
+11 & SYS\_READ     & Read bytes from a filesystem-backed descriptor into a user buffer. \\
+12 & SYS\_CLOSE    & Close a filesystem-backed descriptor. \\
+13 & SYS\_LS       & List entries in the root directory into a user-provided array of \texttt{dirent}. \\
+14 & SYS\_GETC     & Blocking read of a single character from the UART console. \\
+15 & SYS\_UNLINK   & Remove a file in the root directory, freeing its blocks and clearing its inode. \\
+16 & SYS\_EXEC     & Replace the current process image with a named user program; handled specially in the trap handler. \\
+17 & SYS\_TRUNC    & Truncate a file by name, setting its size to zero but keeping its block allocations. \\
+18 & SYS\_PS       & Dump the kernel process list via \texttt{proc\_dump}. \\
+19 & SYS\_SHUTDOWN & Shut down the system: disable interrupts, free all processes, and halt the CPU with \texttt{wfi}. \\
+20 & SYS\_SUSPEND  & Move the current process to the blocked list and schedule another process; used by background workers. \\
+\hline
+\end{longtable}
+
+\subsubsection{Exec Support}
+
+Exec-style program replacement is implemented in a simple way. A small static
+\texttt{exec\_table} maps program names to function entry points that are linked into
+the kernel image, for example:
+\begin{itemize}
+  \item \texttt{"sh"} \(\rightarrow\) \texttt{user\_shell}.
+\end{itemize}
+The helper \texttt{sys\_exec\_lookup} is called by the trap handler when processing
+\texttt{SYS\_EXEC}. On success, the handler updates \texttt{mepc} to the new user entry
+point and reinitializes \texttt{a0} and \texttt{a1} (\texttt{argc} and \texttt{argv}).
+
+\section{User Space and Shell (usr/)}
+
+User-space code resides under \texttt{usr/}. All programs use a common header
+\texttt{user.h}, which imports kernel-visible definitions (filesystem types,
+string helpers, syscall numbers) and declares thin syscall wrappers built on top
+of the generic \texttt{sys\_call3} function implemented in \texttt{sys\_call.c}.
+
+\subsection{Syscall Wrappers}
+
+Each user-visible function like \texttt{sys\_write}, \texttt{sys\_open},
+\texttt{sys\_fork}, or \texttt{sys\_shutdown} is a small wrapper that sets up
+arguments in registers \texttt{a0--a2}, the system call number in \texttt{a7}, and
+executes an \texttt{ecall}. The kernel's trap handler then dispatches to the
+appropriate system call implementation.
+
+\subsection{Shell Overview}
+
+The main user program is an interactive shell implemented in \texttt{usr/shell.c}.
+It runs as a regular process and interacts with the kernel exclusively via
+syscalls.
+
+The shell's architecture includes:
+\begin{itemize}
+  \item A simple line editor that reads characters using \texttt{sys\_getc}, handles
+        backspace locally, and echoes input via \texttt{sys\_write}.
+  \item A tokenization routine that splits a command line into at most eight
+        whitespace-separated arguments (\texttt{argv}).
+  \item A set of built-in commands implemented directly in C, without spawning
+        external programs.
+  \item Minimal support for ``pipelines'' through a temporary file name
+        (\texttt{\_\_pipe.tmp}), which is used to pass the output of one command to
+        another in simple scenarios.
+\end{itemize}
+
+\subsection{Supported Shell Commands}
+
+The shell currently supports the following built-in commands:
+
+\begin{itemize}
+  \item \textbf{\texttt{ls}}: list files in the root directory by calling \texttt{sys\_ls}
+        and printing each returned \texttt{dirent} name.
+  \item \textbf{\texttt{cat FILE}}: open a file with \texttt{sys\_open}, read its
+        contents with \texttt{sys\_read}, and write them to standard output. When
+        invoked without an argument in a pipeline mode, it reads from the temporary
+        pipe file.
+  \item \textbf{\texttt{read FILE}}: an alias of \texttt{cat FILE}.
+  \item \textbf{\texttt{echo ARGS...}}: print its arguments separated by spaces and
+        terminated by a newline.
+  \item \textbf{\texttt{touch F}}: create an empty file if it does not exist, by
+        attempting \texttt{sys\_open(F, 0)} and, on failure, \texttt{sys\_open(F, 1)}.
+  \item \textbf{\texttt{rm F}}: remove a file using \texttt{sys\_unlink}; prints an
+        error message on failure.
+  \item \textbf{\texttt{mv A B}}: move (rename) a file by copying data from A to B
+        and then unlinking A. If B exists, it is first unlinked and recreated.
+  \item \textbf{\texttt{pwd}}: print the current directory, which is always \texttt{/}
+        because the filesystem is currently flat.
+  \item \textbf{\texttt{mkdir D}}, \textbf{\texttt{rmdir D}}: print informative messages
+        indicating that hierarchical directories are not supported.
+  \item \textbf{\texttt{write F TEXT...}}: (re)write a file. The command concatenates
+        all arguments after the filename into a single space-separated string and
+        writes it into the file, truncating it first via \texttt{sys\_trunc}. When
+        used with a pipeline, it can also write the contents of the temporary pipe
+        file into the target file.
+  \item \textbf{\texttt{fork}}: demonstration of the \texttt{fork} system call. The
+        parent prints the child's PID and then calls \texttt{sys\_wait} to synchronize.
+        The child prints a message and exits.
+  \item \textbf{\texttt{bg}}: create a simple background worker process by forking
+        and calling \texttt{sys\_suspend} in the child, which moves it into the
+        blocked list without consuming CPU.
+  \item \textbf{\texttt{kill PID}}: kill a process by PID via \texttt{sys\_kill}.
+  \item \textbf{\texttt{ps}}: list processes by invoking the \texttt{SYS\_PS}
+        system call, which calls \texttt{proc\_dump} in the kernel.
+  \item \textbf{\texttt{help}}: print a summary of all built-in commands and a short
+        description of each.
+  \item \textbf{\texttt{exit}}: shutdown the system by calling \texttt{sys\_shutdown}.
+        The shell prints a hint about exiting the QEMU emulator.
+  \item \textbf{\texttt{halt}}: synonym for \texttt{exit}, directly calling
+        \texttt{sys\_shutdown} without additional messages.
+\end{itemize}
+
+Through these commands, the shell exercises most of the kernel subsystems:
+filesystem operations (\texttt{ls}, \texttt{cat}, \texttt{write}, \texttt{rm},
+\texttt{mv}, \texttt{touch}), process control (\texttt{fork}, \texttt{bg}, \texttt{kill},
+\texttt{ps}), and shutdown paths (\texttt{exit}, \texttt{halt}).
+
+\section{Summary}
+
+Lrix demonstrates a compact yet complete path from bare-metal RISC-V boot to
+an interactive user shell. Despite its small size, it covers many classic OS
+concepts: a page-based physical allocator, a minimal virtual memory abstraction,
+round-robin process scheduling with blocking and zombies, a simple inode-based
+filesystem over VirtIO block storage, a trap and interrupt subsystem tied into
+RISC-V CSRs and the PLIC, and a syscall interface consumed by user-space
+programs.
+
+Because the design is intentionally straightforward and the codebase is fully
+self-contained, Lrix serves as a good foundation for experimentation and
+extension, such as adding per-process address spaces, hierarchical directories,
+more sophisticated scheduling policies, or richer user-level utilities. Here I 
+still want to emphasize that Lrix only runs under Machine Mode.
+
+\printbibliography
+
+\end{document}
