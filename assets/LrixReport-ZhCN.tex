@@ -1,3 +1,14 @@
+%
+% Lrix
+% Copyright (C) 2025 lrisguan <lrisguan@outlook.com>
+% 
+% This program is released under the terms of the GNU General Public License version 2(GPLv2).
+% See https://opensource.org/licenses/GPL-2.0 for more information.
+% 
+% Project homepage: https://github.com/lrisguan/Lrix
+% Description: A scratch implemention of OS based on RISC-V
+%
+
 \documentclass[12pt]{ctexart}
 \usepackage[margin=1.9cm]{geometry}
 \usepackage[UTF8]{ctex}
@@ -342,20 +353,20 @@ Lrix采用标准的三级Sv39页表方案：
   \hline
   \textbf{成员名} & \textbf{数据类型} & \textbf{说明} \\
   \hline
-  \endfirsthead  % 第一页表头结束
+  \endfirsthead  
 
   \caption[]{进程控制块（ProcessControlBlock, PCB）结构体定义（续表）} \\
   \hline
   \textbf{成员名} & \textbf{数据类型} & \textbf{说明} \\
   \hline
-  \endhead  % 后续页面表头
+  \endhead  
 
   \hline
   \multicolumn{3}{r}{下一页续表} \\
-  \endfoot  % 每页表尾（非最后一页）
+  \endfoot  
 
   \hline
-  \endlastfoot  % 最后一页表尾
+  \endlastfoot  
 
   pid            & int         & 进程唯一标识符 \\
   \hline

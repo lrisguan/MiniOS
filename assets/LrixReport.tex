@@ -1,3 +1,14 @@
+%
+% Lrix
+% Copyright (C) 2025 lrisguan <lrisguan@outlook.com>
+% 
+% This program is released under the terms of the GNU General Public License version 2(GPLv2).
+% See https://opensource.org/licenses/GPL-2.0 for more information.
+% 
+% Project homepage: https://github.com/lrisguan/Lrix
+% Description: A scratch implemention of OS based on RISC-V
+%
+
 \documentclass[12pt]{article}
 \usepackage[margin=1.9cm]{geometry}
 \usepackage{times}
@@ -18,7 +29,7 @@
 \addbibresource{./lrixref.bib}
 
 \setmainfont{TeX Gyre Termes}
-%\setsansfont{Arial}
+
 \setmonofont{DejaVu Sans Mono}
 \makeatletter
 \newcommand\dlmu[2][4cm]{\hskip1pt\underline{\hb@xt@ #1{\hss#2\hss}}\hskip3pt}
@@ -379,20 +390,20 @@ is the process control block (PCB), which contains:
   \hline
   \textbf{Member Name} & \textbf{Data Type} & \textbf{Description} \\
   \hline
-  \endfirsthead  % 第一页表头结束
+  \endfirsthead  
 
   \caption[]{Definition of ProcessControlBlock (PCB) Structure (Continued)} \\
   \hline
   \textbf{Member Name} & \textbf{Data Type} & \textbf{Description} \\
   \hline
-  \endhead  % 后续页面表头
+  \endhead  
 
   \hline
   \multicolumn{3}{r}{Continued on next page} \\
-  \endfoot  % 每页表尾（非最后一页）
+  \endfoot  
 
   \hline
-  \endlastfoot  % 最后一页表尾
+  \endlastfoot  
 
   pid            & int         & Process unique identifier \\
   \hline
