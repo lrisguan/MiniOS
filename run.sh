@@ -21,12 +21,15 @@ if [ "$1" == "--help" ]; then
     echo "               1 for virtio legacy, 2 for virtio modern"
     echo "  --FS_DEBUG   Enable filesystem debug mode"
     echo "               1 to enable, 0 to disable"
+    echo "  --TRAP_DEBUG Enable trap debug mode"
+    echo "               1 to enable, 0 to disable"
     exit 0
 fi
 
 virtio=""
 fs_debug=""
 recreate_disk=""
+trap_debug=""
 
 echo "checking virtio option..."
 echo "1 for virtio legacy, 2 for virtio modern"
@@ -39,6 +42,13 @@ fi
 echo "checking FS_DEBUG option..."
 read -p "Enable filesystem debug mode? (1 to enable, 0 to disable): " fs_debug
 if [ "$fs_debug" != "0" ] && [ "$fs_debug" != "1" ]; then
+    echo "Invalid FS_DEBUG option. Please select 0 or 1."
+    exit 1
+fi
+
+echo "checking TRAP_DEBUG option..."
+read -p "Enable trap debug mode? (1 to enable, 0 to disable): " trap_debug
+if [ "$trap_debug" != "0" ] && [ "$trap_debug" != "1" ]; then
     echo "Invalid FS_DEBUG option. Please select 0 or 1."
     exit 1
 fi
@@ -63,8 +73,8 @@ fi
 
 echo "All options set."
 
-echo "Starting the OS with virtio version $virtio and FS_DEBUG set to $fs_debug..."
+echo "Starting the OS with virtio version $virtio, FS_DEBUG set to $fs_debug and TRAP_DEBUG set to $trap_debug..."
 
 make clean
 
-make VIRTIO=$virtio FS_DEBUG=$fs_debug run
+make VIRTIO=$virtio FS_DEBUG=$fs_debug  TRAP_DEBUG=$trap_debug run

@@ -155,6 +155,8 @@ Flags of [Makefile](./Makefile):
 |---------------------------------------|-----------------------------------------------------------------|
 | make FS_DEBUG=1 VIRTIO=1 run          | Enable file system debug logs, use legacy VirtIO mode           |
 | make FS_DEBUG=0 VIRTIO=2 run          | Disable file system debug logs, use modern VirtIO mode          |
+| make TRAP_DEBUG=1 run                 | Enable trap debug logs                                          |
+
 ### Run
 > [!Warning]
 > To use flag `VIRTIO=2`, your qemu version needs to be higher than 5. <br>

@@ -56,6 +56,7 @@ info:
 	@echo "Examples:"
 	@echo "  make FS_DEBUG=1 VIRTIO=1 run  # enable fs debug logs, use legacy virtio"
 	@echo "  make FS_DEBUG=0 VIRTIO=2 run  # disable fs debug logs, use modern virtio"
+	@echo "  make TRAP_DEBUG=1 run"        # enable trap debug logs (not recommand to enable)"
 	@echo
 	@echo "---------------------------------------------------------------------------------"
 	@echo "=== kernel/Makefile info ==="
