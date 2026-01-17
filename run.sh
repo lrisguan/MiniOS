@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # Lrix
 # Copyright (C) 2025 lrisguan <lrisguan@outlook.com>
 # 
@@ -7,7 +9,6 @@
 # Project homepage: https://github.com/lrisguan/Lrix
 # Description: A scratch implemention of OS based on RISC-V
 
-#!/bin/bash
 # This script runs the os.
 
 echo "checking options..."
