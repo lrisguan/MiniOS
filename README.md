@@ -87,10 +87,11 @@ To run this project, you need to have belowings:
     ##### Install from souce
     
     > [!Tip]
-    > If you install qemu from source, may you need a higher version of **glibc**. When I compile it, the version is **2.35** at least. Considering that **glibc** is a very import system dependency, I recommand to compile **qemu** in docker instead. You can see the fowlling **docker(optional)** part.
+    > If you install qemu from source, may you need a higher version of **glibc**. When I compile it, the version is **2.35** at least. Considering that **glibc** is a very import system dependency, I recommand to compile **qemu** in docker instead. You can see the following **docker(optional)** part.
 
     ```bash
     git clone https://github.com/qemu/qemu.git
+    cd qemu
     mkdir build
     cd build
     ../configure
@@ -119,6 +120,7 @@ To run this project, you need to have belowings:
     # then you enter the container with higher glibc
     # and you can compile latest qemu
     git clone https://github.com/qemu/qemu.git
+    cd qemu
     mkdir build
     cd build
     ../configure

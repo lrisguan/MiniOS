@@ -89,6 +89,7 @@ https://github.com/user-attachments/assets/a500f8f4-6f2b-42ed-9ab6-f23aaa7f8497
 
     ```bash
     git clone https://github.com/qemu/qemu.git 
+    cd qemu
     mkdir build
     cd build
     ../configure
@@ -117,6 +118,7 @@ https://github.com/user-attachments/assets/a500f8f4-6f2b-42ed-9ab6-f23aaa7f8497
     # 然后进入具有更高 glibc 版本的容器
     # 即可编译最新版 qemu
     git clone https://github.com/qemu/qemu.git 
+    cd qemu
     mkdir build
     cd build
     ../configure
